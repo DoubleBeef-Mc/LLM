@@ -26,15 +26,19 @@ def extract_json_from_text(text: str):
         return match.group(0)# 返回匹配到的 JSON 字符串
     return None
 
-def classify_comment_to_json(comment: str, max_retries: int = 2):
+def classify_comment_to_json(comment: str, max_retries: int = 3):
     #让模型输出 JSON，包含 result 和 reason。返回解析后的 dict，如果多次尝试都失败则返回 None。
     
     system_prompt = (
-        "你是一个评论审核专家。请判断下面的小红书评论是正面还是负面。"
-        "请严格按 JSON 格式输出，不要添加任何其他文字。"
-        '格式示例：{"result": 1, "reason": "这里写判断理由"}'
-        "其中 result 为 1 表示正面，0 表示负面。"
-    )
+    "你是一个评论审核专家。请判断下面的小红书评论是正面还是负面。"
+    "严格按照 JSON 格式输出，不要添加任何其他文字。\n"
+    "格式：{\"result\": 1, \"reason\": \"你的判断理由\"}\n"
+    "规则：\n"
+    "- result 为 1 表示正面，0 表示负面\n"
+    "- reason 必须结合评论内容，用简短的句子解释为什么这样判断，不要只写'正面'或'负面'，也不要写'这里写判断理由'\n"
+    "示例1：评论'这家店太好吃了！' → {\"result\": 1, \"reason\": \"直接表达了对食物的赞美\"}\n"
+    "示例2：评论'等了两小时才上菜' → {\"result\": 0, \"reason\": \"对服务速度表达不满\"}"
+)
     user_prompt = f"评论：{comment}\n请输出JSON："
 
     for attempt in range(max_retries):
@@ -55,7 +59,7 @@ def classify_comment_to_json(comment: str, max_retries: int = 2):
             generated_ids = model.generate(
                 **inputs,
                 max_new_tokens=80,
-                do_sample=False,
+                do_sample=True,
                 pad_token_id=tokenizer.eos_token_id
             )
         output_ids = generated_ids[0][inputs.input_ids.shape[1]:].tolist()
