@@ -1,129 +1,166 @@
 import csv
+import json
 import re
-from modelscope import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
 
+# 本地模型路径
+model_dir = r"C:\Users\mbr\Desktop\LLM\LLM\Qwen3-0.6B"
 
-model_name = "Qwen/Qwen3-0.6B"
 
-tokenizer = AutoTokenizer.from_pretrained(model_name)
+tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
 model = AutoModelForCausalLM.from_pretrained(
-    model_name,
+    model_dir,
     torch_dtype="auto",
-    device_map="auto"
+    device_map="auto",
+    trust_remote_code=True
 )
 model.eval()
 
 
-def classify_comment(comment: str) -> str:
-    """返回 '正面' 或 '负面'"""
-    messages = [
-        {"role": "system", "content": "你是一个情感分类专家。请阅读用户给出的小红书评论，并判断情感倾向。只回复'正面'或'负面'，不要加任何标点或解释。"},
-        {"role": "user", "content": f"评论：{comment}\n情感倾向："}
-    ]
+def extract_json_from_text(text: str):
+    # 从文本中提取第一个看起来像 JSON 对象的字符串
+    # 尝试匹配 {...} 的最外层结构，允许跨行，但不允许嵌套大括号
+    match = re.search(r'\{[^{}]*\}', text, re.DOTALL)# 这个正则表达式会匹配第一个大括号内的内容，且不允许嵌套大括号。如果输出中有多余的文字或者格式不正确，这个方法可能无法提取到正确的 JSON，但在大多数情况下应该能正常工作。
+    if match:
+        return match.group(0)# 返回匹配到的 JSON 字符串
+    return None
+
+def classify_comment_to_json(comment: str, max_retries: int = 2):
+    #让模型输出 JSON，包含 result 和 reason。返回解析后的 dict，如果多次尝试都失败则返回 None。
     
-    text = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-        enable_thinking=False
+    system_prompt = (
+        "你是一个评论审核专家。请判断下面的小红书评论是正面还是负面。"
+        "请严格按 JSON 格式输出，不要添加任何其他文字。"
+        '格式示例：{"result": 1, "reason": "这里写判断理由"}'
+        "其中 result 为 1 表示正面，0 表示负面。"
     )
-    inputs = tokenizer([text], return_tensors="pt").to(model.device)
+    user_prompt = f"评论：{comment}\n请输出JSON："
 
-    with torch.no_grad():#在生成文本时不计算梯度，节省内存和计算资源，因为我们只需要模型的推理能力来进行分类，而不需要进行训练或微调。
-        generated_ids = model.generate(
-            **inputs,
-            max_new_tokens=10,
-            do_sample=False,         # 确定性输出，提高一致性
-            temperature=0.9,
-            top_k=0.9,
-            top_p=0.9,
-            pad_token_id=tokenizer.eos_token_id
+    for attempt in range(max_retries):
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ]
+
+        text = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False
         )
-    output_ids = generated_ids[0][inputs.input_ids.shape[1]:].tolist()
-    output_text = tokenizer.decode(output_ids, skip_special_tokens=True).strip()
-    
-    # 解析输出，提取正面/负面
-    if "负面" in output_text:
-        return "负面"
-    elif "正面" in output_text:
-        return "正面"
-    else:
-        # 无法识别时，随机给正面（后续统计会体现）
-        return "正面"  # 默认正面，但会被视为错误
+        inputs = tokenizer([text], return_tensors="pt").to(model.device)
+
+        with torch.no_grad():
+            generated_ids = model.generate(
+                **inputs,
+                max_new_tokens=80,
+                do_sample=False,
+                pad_token_id=tokenizer.eos_token_id
+            )
+        output_ids = generated_ids[0][inputs.input_ids.shape[1]:].tolist()
+        output_text = tokenizer.decode(output_ids, skip_special_tokens=True).strip()
+
+        # 尝试提取 JSON
+        json_str = extract_json_from_text(output_text)
+        if json_str is None:
+            # 没找到大括号，重试
+            continue
+
+        try:
+            parsed = json.loads(json_str)# 解析 JSON，可能会失败
+            # 确保字段存在
+            if "result" in parsed and "reason" in parsed:# 如果解析成功且字段完整，返回结果
+                return parsed
+            else:
+                # 字段不全，重试
+                continue
+        except (json.JSONDecodeError, ValueError):
+            # 解析失败，重试
+            continue
+
+    # 所有重试都失败
+    return None
 
 
+# 读取数据
 data = []
 try:
     with open("xiaohongshu_comments.csv", "r", encoding="utf-8-sig") as f:
         reader = csv.reader(f)
-        header = next(reader)  # 跳过表头
+        next(reader)
         for row in reader:
             if len(row) >= 2:
                 data.append((row[0].strip(), row[1].strip()))
 except FileNotFoundError:
-    print("错误：找不到 xiaohongshu_comments.csv，请确保文件在当前目录")
+    print("错误：找不到 xiaohongshu_comments.csv")
     exit()
-
-
 
 
 true_labels = []
 pred_labels = []
 results = []
+parse_failures = 0
 
 for idx, (comment, true_label) in enumerate(data, 1):
     if not comment:
-        continue  # 跳过空评论
-    pred = classify_comment(comment)
+        continue
+
+    parsed = classify_comment_to_json(comment)# 解析评论，得到 dict 或 None
+    if parsed is None:
+        # 放弃该条
+        parse_failures += 1
+        pred = "未知"
+        reason = "解析失败"
+    else:
+        pred_num = parsed["result"]
+        pred = "正面" if pred_num == 1 else "负面"
+        reason = parsed["reason"]
+
     true_labels.append(true_label)
     pred_labels.append(pred)
-    results.append((comment, true_label, pred))
+    results.append((comment, true_label, pred, reason))
+
     if idx % 20 == 0:
-        print(f"进度: {idx}/{len(data)}")
+        print(f"进度: {idx}/{len(data)} （解析失败累计: {parse_failures}）")
 
-
-from collections import Counter
-
-# 准确率
+# 计算指标（忽略“未知”标签，或者视其为错误）
+# 这里我们把“未知”当作预测错误来处理
 correct = sum(1 for t, p in zip(true_labels, pred_labels) if t == p)
 accuracy = correct / len(true_labels) if true_labels else 0
-
 
 tp = sum(1 for t, p in zip(true_labels, pred_labels) if t == "正面" and p == "正面")
 fn = sum(1 for t, p in zip(true_labels, pred_labels) if t == "正面" and p == "负面")
 fp = sum(1 for t, p in zip(true_labels, pred_labels) if t == "负面" and p == "正面")
 tn = sum(1 for t, p in zip(true_labels, pred_labels) if t == "负面" and p == "负面")
 
-# 精确率、召回率、F1（正类为正面）
-precision_pos = tp / (tp + fp) if (tp + fp) > 0 else 0
-recall_pos = tp / (tp + fn) if (tp + fn) > 0 else 0
-f1_pos = 2 * precision_pos * recall_pos / (precision_pos + recall_pos) if (precision_pos + recall_pos) > 0 else 0
+# 如果预测为“未知”，不计入任何混淆矩阵元素，但会降低准确率
+unknown_count = sum(1 for p in pred_labels if p == "未知")
 
-precision_neg = tn / (tn + fn) if (tn + fn) > 0 else 0
-recall_neg = tn / (tn + fp) if (tn + fp) > 0 else 0
-f1_neg = 2 * precision_neg * recall_neg / (precision_neg + recall_neg) if (precision_neg + recall_neg) > 0 else 0
+def calc_metrics(tp, fp, fn):
+    p = tp / (tp + fp) if (tp + fp) > 0 else 0
+    r = tp / (tp + fn) if (tp + fn) > 0 else 0
+    f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0
+    return p, r, f1
 
+p_pos, r_pos, f1_pos = calc_metrics(tp, fp, fn)
+p_neg, r_neg, f1_neg = calc_metrics(tn, fn, fp)
 
 print("\n=== 分类评估结果 ===")
 print(f"总样本数: {len(true_labels)}")
+print(f"成功解析数: {len(true_labels) - unknown_count}")
+print(f"解析失败数: {unknown_count}")
 print(f"准确率 (Accuracy): {accuracy:.4f} ({correct}/{len(true_labels)})")
-print(f"\n混淆矩阵:")
+print(f"\n混淆矩阵（不含未知）:")
 print(f"              预测正面  预测负面")
 print(f"实际正面        {tp:4d}      {fn:4d}")
 print(f"实际负面        {fp:4d}      {tn:4d}")
-print(f"\n正面类别:")
-print(f"  精确率 (Precision): {precision_pos:.4f}")
-print(f"  召回率 (Recall):    {recall_pos:.4f}")
-print(f"  F1-score:          {f1_pos:.4f}")
-print(f"\n负面类别:")
-print(f"  精确率 (Precision): {precision_neg:.4f}")
-print(f"  召回率 (Recall):    {recall_neg:.4f}")
-print(f"  F1-score:          {f1_neg:.4f}")
+print(f"\n正面类别: P={p_pos:.4f}, R={r_pos:.4f}, F1={f1_pos:.4f}")
+print(f"负面类别: P={p_neg:.4f}, R={r_neg:.4f}, F1={f1_neg:.4f}")
 
-
-output_file = "classified_comments.csv"
-with open(output_file, "w", newline="", encoding="utf-8-sig") as f:
+# 保存结果（新增 reason 列）
+with open("classified_comments_json.csv", "w", newline="", encoding="utf-8-sig") as f:
     writer = csv.writer(f)
-    writer.writerow(["评论内容", "真实标签", "预测标签"])
+    writer.writerow(["评论内容", "真实标签", "预测标签", "判断理由"])
     writer.writerows(results)
+print("结果已保存到 classified_comments_json.csv")
